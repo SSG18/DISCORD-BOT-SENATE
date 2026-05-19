@@ -1,5 +1,7 @@
 // ══════════════════════════════════════════════════════════════════
 //  СОЗДАНО И РАЗРАБОТАНО TREAK_ (ВЯЧЕСЛАВ ЛЕБЕДЕВ)
+//  Отдельная благодарность сообществу SA-GOP за вдохновение и поддержку в развитии этого бота.
+//  LICENSE: MIT
 // ══════════════════════════════════════════════════════════════════
 
 import 'dotenv/config';
@@ -52,7 +54,7 @@ const FORUM_TAGS = {
   VETOED:       process.env.FORUM_TAG_VETOED
 };
 
-const FOOTER      = '🦅 Республиканская партия США — Штат Сан-Андреас';
+const FOOTER      = '🦅 Идея и разработка by @treak_';
 const FOOTER_ICON = 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9b/Republicanlogo.svg/1200px-Republicanlogo.svg.png';
 
 const COLORS = {
@@ -396,45 +398,55 @@ async function sendEphemeralChunks(interaction, text, delay = TTL_L) {
   }
 }
 
-function buildVoteListText(proposalId, stage = 1) {
+function formatMentionList(ids) {
+  if (!ids.length) return '*нет*';
+  return ids.map(id => `<@${id}>`).join('\n');
+}
+
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function buildVoteListEmbeds(proposalId, stage = 1, opts = {}) {
   const p = db.getProposal(proposalId);
   if (!p) return null;
   const votes = db.getVotes(proposalId, stage);
   if (!votes.length) return null;
-  const items = p.isQuantitative ? db.getQuantitativeItems(proposalId) : [];
-  const itemMap = new Map(items.map(it => [it.itemIndex, it.text]));
-  const lines = [
-    '## 🗳️ Поимённое голосование',
+  const voting = db.getVoting(proposalId);
+
+  const headerLines = [
     `**${p.number}** — ${p.name}`,
     `Этап: **${stage}**`,
     `Тип: **${p.isQuantitative ? 'Рейтинговое' : 'Обычное'}**`,
-    '---'
+    `Голосование: **${voting?.isSecret ? 'Тайное' : 'Открытое'}**`
   ];
+  if (opts.includeSecretWarning && voting?.isSecret) headerLines.push('## ⚠️ ТАЙНОЕ ГОЛОСОВАНИЕ НЕ ПУБЛИКУЙ РЕЗУЛЬТАТЫ');
 
+  const fields = [];
   if (p.isQuantitative) {
-    const byItem = new Map(items.map(it => [it.itemIndex, { text: it.text, voters: [] }]));
+    const items = db.getQuantitativeItems(proposalId);
+    const itemMap = new Map(items.map(it => [it.itemIndex, it.text]));
+    const byItem = new Map(items.map(it => [it.itemIndex, []]));
     const abstain = [];
     for (const v of votes) {
       if (v.voteType.startsWith('item_')) {
         const idx = parseInt(v.voteType.split('_')[1]);
-        if (!byItem.has(idx)) byItem.set(idx, { text: itemMap.get(idx) || '', voters: [] });
-        byItem.get(idx).voters.push(v.userId);
+        if (!byItem.has(idx)) byItem.set(idx, []);
+        byItem.get(idx).push(v.userId);
       } else if (v.voteType === 'abstain') {
         abstain.push(v.userId);
       }
     }
 
     const sorted = [...byItem.entries()].sort((a, b) => a[0] - b[0]);
-    for (const [idx, info] of sorted) {
-      const title = `**Пункт ${idx}${info.text ? ` — ${truncate(info.text, 80)}` : ''} (${info.voters.length})**`;
-      lines.push(title);
-      if (info.voters.length) for (const uid of info.voters) lines.push(`• <@${uid}>`);
-      else lines.push('*нет голосов*');
-      lines.push('');
+    for (const [idx, voters] of sorted) {
+      const title = `📌 Пункт ${idx}${itemMap.get(idx) ? ` — ${truncate(itemMap.get(idx), 80)}` : ''} (${voters.length})`;
+      const value = truncate(formatMentionList(voters), 1024);
+      fields.push({ name: title, value, inline: false });
     }
-    lines.push(`**⚪ Воздержались (${abstain.length})**`);
-    if (abstain.length) for (const uid of abstain) lines.push(`• <@${uid}>`);
-    else lines.push('*нет*');
+    fields.push({ name: `⚪ Воздержались (${abstain.length})`, value: truncate(formatMentionList(abstain), 1024), inline: false });
   } else {
     const grouped = { for: [], against: [], abstain: [] };
     for (const v of votes) {
@@ -442,18 +454,38 @@ function buildVoteListText(proposalId, stage = 1) {
       else if (v.voteType === 'against') grouped.against.push(v.userId);
       else grouped.abstain.push(v.userId);
     }
-    const addSection = (title, arr) => {
-      lines.push(`**${title} (${arr.length})**`);
-      if (arr.length) for (const uid of arr) lines.push(`• <@${uid}>`);
-      else lines.push('*нет*');
-      lines.push('');
-    };
-    addSection('✅ За', grouped.for);
-    addSection('❌ Против', grouped.against);
-    addSection('⚪ Воздержались', grouped.abstain);
+    fields.push({ name: `✅ За (${grouped.for.length})`, value: truncate(formatMentionList(grouped.for), 1024), inline: false });
+    fields.push({ name: `❌ Против (${grouped.against.length})`, value: truncate(formatMentionList(grouped.against), 1024), inline: false });
+    fields.push({ name: `⚪ Воздержались (${grouped.abstain.length})`, value: truncate(formatMentionList(grouped.abstain), 1024), inline: false });
   }
 
-  return lines.join('\n').trim();
+  const embeds = [];
+  const fieldChunks = chunkArray(fields, 25);
+  fieldChunks.forEach((chunk, idx) => {
+    const embed = buildEmbed({
+      color: COLORS.WARNING,
+      title: idx === 0 ? '🗳️ Поимённое голосование' : '🗳️ Поимённое голосование — продолжение',
+      description: idx === 0 ? headerLines.join('\n') : null
+    });
+    embed.addFields(...chunk);
+    embeds.push(embed);
+  });
+
+  return embeds.length ? embeds : null;
+}
+
+async function sendEphemeralEmbeds(interaction, embeds, delay = TTL_L) {
+  const chunks = chunkArray(embeds || [], 10);
+  if (!chunks.length) { await replyEphemeral(interaction, 'ℹ️ Нет данных.', TTL_S); return; }
+
+  await replyEphemeral(interaction, { embeds: chunks[0] }, delay);
+  for (let i = 1; i < chunks.length; i++) {
+    const msg = await interaction.followUp({ embeds: chunks[i], flags: 64 }).catch(() => null);
+    if (msg) {
+      if (delay > 0) setTimeout(() => msg.delete().catch(() => {}), delay);
+      enqueueUserMsg(msg.channelId, msg.id, Date.now() + (delay || TTL_M));
+    }
+  }
 }
 
 // ════════════════════════ VALIDATION ═══════════════════════════════
@@ -476,7 +508,8 @@ const commands = [
   new SlashCommandBuilder().setName('say').setDescription('Отправить сообщение от имени бота')
     .addStringOption(o => o.setName('text').setDescription('Текст сообщения').setRequired(true).setMaxLength(2000))
     .addChannelOption(o => o.setName('channel').setDescription('Канал отправки').addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
-  new SlashCommandBuilder().setName('info').setDescription('Поимённый список голосования'),
+  new SlashCommandBuilder().setName('info').setDescription('не работает - для разработчика')
+    .addStringOption(o => o.setName('proposal_id').setDescription('не работает').setRequired(true)),
   new SlashCommandBuilder().setName('vote').setDescription('Принудительно запустить голосование (без повестки)')
     .addStringOption(o => o.setName('proposal_id').setDescription('Номер SA-001').setRequired(true)),
   new SlashCommandBuilder().setName('create_meeting').setDescription('Создать заседание Сената'),
@@ -545,17 +578,13 @@ async function updateSenateMainMessage() {
         buildEmbed({
           color: COLORS.PRIMARY, title: '🏛️ Сенат Штата Сан-Андреас', thumbnail: FOOTER_ICON,
           description: [
-            '## 🇺🇸 Официальный законодательный орган Штата Сан-Андреас',
-            '',
-            '**⚖️ Полномочия:** принятие законов, утверждение бюджета, формирование повестки заседаний',
+            '## 🇺🇸 Законодательный и представительный орган Штата Сан-Андреас',
             '',
             '**📜 Подача законопроекта:** воспользуйтесь кнопкой **Подать законопроект** ниже',
             '**🏛️ Гражданская инициатива:** нажмите кнопку **Гражданская инициатива** ниже'
           ].join('\n'),
           fields: [
-            { name: 'Орган', value: 'Сенат Штата Сан-Андреас', inline: true },
-            { name: 'Государство', value: 'США', inline: true },
-            { name: 'Поддержка', value: 'Республиканская партия США', inline: true }
+            { name: 'Особая благодарность ответственному за разработку', value: '@treak_', inline: true }
           ]
         }),
         buildEmbed({ color: COLORS.NAVY, title: `👥 Состав Сената — ${count} сенаторов`, description: text })
@@ -1021,8 +1050,8 @@ async function showHelp(interaction) {
   await interaction.deferReply({ flags: 64 });
   const m = interaction.member;
   const lines = ['## 📖 Справочник команд'];
-  if (isSenator(m) || isAdmin(m)) lines.push('**Для сенаторов:**\n`/send` — подать законопроект\n`/info` — поимённый список голосования\n`/replace_senator` — замена/добавление сенатора');
-  if (isChairman(m, 'senate') || isAdmin(m)) lines.push('**Для Спикера:**\n`/create_meeting` — создать заседание\n`/edit_agenda` — редактировать повестку\n`/vote <SA-xxx>` — принудительное голосование\n`/set` — установить состав вручную\n`/setup_senate` — создать главное сообщение\n`/refresh_senate` — синхронизировать состав из Discord\n`/say` — отправить сообщение от имени бота');
+  if (isSenator(m) || isAdmin(m)) lines.push('**Для сенаторов:**\n`/send` — подать законопроект\n`/replace_senator` — замена/добавление сенатора');
+  if (isChairman(m, 'senate') || isAdmin(m)) lines.push('**Для Спикера:**\n`/create_meeting` — создать заседание\n`/edit_agenda` — редактировать повестку\n`/vote <SA-xxx>` — принудительное голосование\n`/set` — установить состав вручную\n`/setup_senate` — создать главное сообщение\n`/refresh_senate` — синхронизировать состав из Discord\n`/say` — отправить сообщение от имени бота\n`/info <SA-xxx>` — поимённый список в ЛС');
   lines.push('**Диагностика:**\n`/crashinfo` — расшифровка кодов ошибок');
   lines.push('**Формулы голосования:** `0` — простое большинство · `1` — ⅔ · `2` — ¾ · `3` — большинство от состава');
   await replyEphemeral(interaction, { embeds: [buildEmbed({ color: COLORS.PRIMARY, title: '📖 Справка', description: lines.join('\n\n') })] }, TTL_L);
@@ -1300,27 +1329,43 @@ async function handleRefreshSenate(interaction) {
 }
 
 async function handleInfoCommand(interaction) {
-  await interaction.deferReply({ flags: 64 });
-  if (!isAdmin(interaction.member) && !isFedGov(interaction.user.id)) { await replyEphemeral(interaction, '❌ Недостаточно прав.', TTL_S); return; }
-  if (!interaction.channel.isThread()) { await replyEphemeral(interaction, '❌ Команда доступна только в ветке законопроекта.', TTL_S); return; }
-  const p = db.getProposalByThreadId(interaction.channel.id);
-  if (!p) { await replyEphemeral(interaction, '❌ Ветка не связана ни с одним законопроектом.', TTL_S); return; }
-  const votes = db.getVotesAllStages(p.id);
-  if (!votes.length) { await replyEphemeral(interaction, '❌ Голосов не обнаружено.', TTL_S); return; }
-  const voting = db.getVoting(p.id);
-  let text = `**${p.number}** — ${p.name}\nТип: **${voting?.isSecret ? 'Тайное' : 'Открытое'}** | Голосов: **${votes.length}**\n\n`;
-  const stages = {};
-  for (const v of votes) { if (!stages[v.stage]) stages[v.stage] = []; stages[v.stage].push(v); }
-  for (const [stage, sv] of Object.entries(stages).sort((a, b) => Number(a[0]) - Number(b[0]))) {
-    text += `**${stage === '1' ? 'Основное голосование' : `Тур ${stage}`}:**\n`;
-    for (const v of sv.sort((a, b) => a.createdAt - b.createdAt)) text += `• <@${v.userId}> — ${getVoteTypeText(v.voteType)} — ${discordTs(v.createdAt, 'f')}\n`;
-    text += '\n';
+  const isDm = interaction.channel?.type === ChannelType.DM;
+  await interaction.deferReply(isDm ? {} : { flags: 64 });
+
+  const sendInfoReply = async (payload, delay = TTL_S) => {
+    const method = interaction.replied || interaction.deferred ? 'editReply' : 'reply';
+    const opts = method === 'reply' && !isDm ? { ...payload, flags: 64 } : payload;
+    await interaction[method](opts);
+    if (delay > 0) setTimeout(() => interaction.deleteReply().catch(() => {}), delay);
+  };
+
+  if (isDm) { await sendInfoReply({ content: '❌ Команда доступна только на сервере.' }); return; }
+  const member = interaction.member;
+  if (!member || !isAdmin(member)) { await sendInfoReply({ content: '❌ Недостаточно прав.' }); return; }
+
+  const num = interaction.options.getString('proposal_id', true).trim().toUpperCase();
+  const p = db.getAllProposals().find(x => x.number === num);
+  if (!p) { await sendInfoReply({ content: `❌ Законопроект **${num}** не найден.` }); return; }
+  const votesAll = db.getVotesAllStages(p.id);
+  if (!votesAll.length) { await sendInfoReply({ content: '❌ Голосов не обнаружено.' }); return; }
+
+  const stages = [...new Set(votesAll.map(v => v.stage))].sort((a, b) => a - b);
+  const embeds = [];
+  stages.forEach((stage, idx) => {
+    const part = buildVoteListEmbeds(p.id, stage, { includeSecretWarning: idx === 0 });
+    if (part?.length) embeds.push(...part);
+  });
+  if (!embeds.length) { await sendInfoReply({ content: 'ℹ️ Поимённый список не найден.' }); return; }
+
+  try {
+    const chunks = chunkArray(embeds, 10);
+    const first = chunks.shift();
+    await interaction.user.send({ embeds: first });
+    for (const chunk of chunks) await interaction.user.send({ embeds: chunk });
+    await replyEphemeral(interaction, '✅ Список отправлен в личные сообщения.', TTL_M);
+  } catch {
+    await replyEphemeral(interaction, '❌ Не удалось отправить ЛС. Проверьте настройки приватности.', TTL_M);
   }
-  const chunks = []; let cur = '';
-  for (const line of text.split('\n')) { if ((cur + line + '\n').length > 1950) { chunks.push(cur); cur = ''; } cur += line + '\n'; }
-  if (cur) chunks.push(cur);
-  try { for (const c of chunks) await interaction.user.send({ content: c }); await replyEphemeral(interaction, '✅ Список отправлен в личные сообщения.', TTL_M); }
-  catch { await replyEphemeral(interaction, '❌ Не удалось отправить ЛС. Проверьте настройки приватности.', TTL_M); }
 }
 
 // ════════════════════════ FORCE VOTE ═══════════════════════════════
@@ -2462,9 +2507,9 @@ async function handleViewVoteListButton(interaction) {
   const parts = interaction.customId.split('_');
   const proposalId = parts[3];
   const stage = parseInt(parts[4]) || 1;
-  const text = buildVoteListText(proposalId, stage);
-  if (!text) { await replyEphemeral(interaction, 'ℹ️ Поимённый список не найден.', TTL_S); return; }
-  await sendEphemeralChunks(interaction, text, TTL_L);
+  const embeds = buildVoteListEmbeds(proposalId, stage, { includeSecretWarning: true });
+  if (!embeds) { await replyEphemeral(interaction, 'ℹ️ Поимённый список не найден.', TTL_S); return; }
+  await sendEphemeralEmbeds(interaction, embeds, TTL_L);
 }
 
 async function handleViewProceduralListButton(interaction) {
@@ -3560,7 +3605,7 @@ async function handleHelpInfoButton(interaction) {
   await replyEphemeral(interaction, {
     embeds: [buildEmbed({ color: COLORS.PRIMARY, title: '🧭 Как работает Законодательный портал',
       description: [
-        '## 📜 Жизненный цикл законопроекта',
+        '## 📜 Стадии рассмотрения аконопроекта',
         '',
         '**1.** 📥 **Регистрация** — подаётся через кнопку «Подать законопроект»',
         '**2.** 📋 **Повестка** — Спикер включает в повестку заседания',
@@ -3747,3 +3792,9 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.login(TOKEN);
+
+// ══════════════════════════════════════════════════════════════════
+//  СОЗДАНО И РАЗРАБОТАНО TREAK_ (ВЯЧЕСЛАВ ЛЕБЕДЕВ)
+//  Отдельная благодарность сообществу SA-GOP за вдохновение и поддержку в развитии этого бота.
+//  LICENSE: MIT
+// ══════════════════════════════════════════════════════════════════
